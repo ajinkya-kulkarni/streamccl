@@ -212,8 +212,7 @@ def label(source: Any, out: Any, *, chunks: Sequence[int] | None = None,
                 out[sl] = provisional
                 total += count
             for pairs in _boundary_pairs(out, shape, tile, connectivity):
-                for a, b in pairs:
-                    resolver.union(int(a), int(b))
+                resolver.union_many(pairs)
             resolver.flush()
             count = total - resolver.merges
             if resolver.merges:
