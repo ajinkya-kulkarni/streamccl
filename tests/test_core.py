@@ -32,7 +32,7 @@ def check(image, chunks, connectivity, *, destination=None, **kwargs):
     return result
 
 
-@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize('ndim', [2, 3])
 def test_random_partitions(ndim):
     rng = np.random.default_rng(148)
     for connectivity in range(1, ndim + 1):
@@ -43,7 +43,7 @@ def test_random_partitions(ndim):
                     check(image, chunks, connectivity)
 
 
-@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize('ndim', [2, 3])
 def test_single_voxel_and_diagonal_contacts(ndim):
     shape = (4,) * ndim
     image = np.zeros(shape, bool)
@@ -51,6 +51,7 @@ def test_single_voxel_and_diagonal_contacts(ndim):
     image[(2,) * ndim] = True
     for connectivity in range(1, ndim + 1):
         check(image, (2,) * ndim, connectivity)
+    # Every type of face/edge/corner contact across a chunk intersection.
     for offset in itertools.product((-1, 0, 1), repeat=ndim):
         if not any(offset):
             continue
@@ -93,45 +94,48 @@ def test_empty_arrays():
 
 def test_memmap_larger_than_chunk(tmp_path):
     shape = (35, 41, 29)
-    source = np.memmap(tmp_path / "input.dat", dtype="uint8", mode="w+", shape=shape)
-    out = np.memmap(tmp_path / "output.dat", dtype="int64", mode="w+", shape=shape)
+    source = np.memmap(tmp_path / 'input.dat', dtype='uint8', mode='w+', shape=shape)
+    out = np.memmap(tmp_path / 'output.dat', dtype='int64', mode='w+', shape=shape)
     rng = np.random.default_rng(80)
     source[:] = rng.random(shape) < 0.12
     check(source, (7, 9, 5), 3, destination=out, workdir=tmp_path)
-    assert not list(tmp_path.glob("streamccl-*"))
+    assert not list(tmp_path.glob('streamccl-*'))
     assert np.count_nonzero(out) == np.count_nonzero(source)
 
 
 def test_integer_output_and_invalid_input():
     image = np.eye(6, dtype=bool)
     check(image, (2, 3), 2, destination=np.empty(image.shape, np.uint16))
-    with pytest.raises(ValueError, match="integer dtype"):
+    with pytest.raises(ValueError, match='integer dtype'):
         label(np.ones((20, 20), bool), np.empty((20, 20), np.uint8))
-    with pytest.raises(ValueError, match="same shape"):
+    with pytest.raises(ValueError, match='same shape'):
         label(image, np.empty((6, 7), np.int64))
-    with pytest.raises(ValueError, match="share memory"):
-        shared = image.astype(np.int64)
-        label(shared, shared)
-    with pytest.raises(ValueError, match="connectivity"):
+    with pytest.raises(ValueError, match='distinct arrays'):
+        same = image.astype(np.int64)
+        label(same, same)
+    with pytest.raises(ValueError, match='share memory'):
+        shared = np.zeros((6, 7), dtype=np.int64)
+        label(shared[:, :6], shared[:, 1:])
+    with pytest.raises(ValueError, match='connectivity'):
         label(image, np.empty(image.shape, np.int64), connectivity=3)
-    with pytest.raises(ValueError, match="connectivity"):
+    with pytest.raises(ValueError, match='connectivity'):
         label(image, np.empty(image.shape, np.int64), connectivity=True)
-    with pytest.raises(ValueError, match="chunks"):
+    with pytest.raises(ValueError, match='chunks'):
         label(image, np.empty(image.shape, np.int64), chunks=(0, 2))
-    with pytest.raises(ValueError, match="memory"):
-        label(image, np.empty(image.shape, np.int64), memory_limit="not a size")
-    with pytest.raises(ValueError, match="2D or 3D"):
+    with pytest.raises(ValueError, match='memory'):
+        label(image, np.empty(image.shape, np.int64), memory_limit='not a size')
+    with pytest.raises(ValueError, match='2D or 3D'):
         label(np.ones(5), np.empty(5, np.int64))
 
 
 def test_memory_planner():
-    budget = _bytes("16MiB")
+    budget = _bytes('16MiB')
     chunks = _plan((1000, 2000, 3000), None, budget)
     assert math.prod(chunks) * 128 + 8 * 1024**2 <= budget
     assert all(c > 0 for c in chunks)
-    with pytest.raises(ValueError, match="budget"):
+    with pytest.raises(ValueError, match='budget'):
         _plan((1000, 1000), (1000, 1000), budget)
-    assert _bytes("2GiB") == 2 * 1024**3
+    assert _bytes('2GiB') == 2 * 1024**3
     assert _bytes(16_000_000) == 16_000_000
 
 
@@ -142,26 +146,22 @@ def test_no_global_reads():
             self.shape = array.shape
             self.dtype = array.dtype
             self.chunks = (4, 5)
-
         def __array__(self, dtype=None):
             return np.asarray(self.array, dtype=dtype)
-
         def __getitem__(self, key):
             assert all(isinstance(s, slice) and s.start is not None and s.stop is not None for s in key)
             assert math.prod(s.stop - s.start for s in key) <= 20
             return self.array[key]
-
         def __setitem__(self, key, value):
             assert math.prod(s.stop - s.start for s in key) <= 20
             self.array[key] = value
-
     source = np.eye(17, 19, dtype=bool)
     out = np.zeros(source.shape, np.int64)
     check(Guarded(source), (4, 5), 2, destination=Guarded(out))
 
 
 def test_sqlite_resolver_implicit_singletons_and_transitive_merges(tmp_path):
-    resolver = Equivalences(tmp_path / "eq.sqlite")
+    resolver = Equivalences(tmp_path / 'eq.sqlite')
     try:
         for a, b in ((90, 20), (80, 30), (20, 30), (30, 10), (90, 10)):
             resolver.union(a, b)
@@ -171,12 +171,14 @@ def test_sqlite_resolver_implicit_singletons_and_transitive_merges(tmp_path):
         old, new = resolver.replacements(np.array([0, 10, 20, 30, 80, 90, 1000]))
         assert dict(zip(old.tolist(), new.tolist())) == {20: 10, 30: 10, 80: 10, 90: 10}
         resolver.flush()
-        assert resolver.db.execute("SELECT count(*) FROM nodes").fetchone()[0] == 5
+        assert resolver.db.execute('SELECT count(*) FROM nodes').fetchone()[0] == 5
     finally:
         resolver.close()
 
 
 def test_boundary_pairs_match_reference_edges():
+    # Exhaustively compare the enumerated cross-chunk adjacency pairs to a
+    # direct voxel-neighbor implementation, including uneven final chunks.
     shape = (5, 6, 4)
     chunks = (2, 3, 2)
     out = np.arange(1, math.prod(shape) + 1, dtype=np.int64).reshape(shape)
@@ -199,9 +201,84 @@ def test_boundary_pairs_match_reference_edges():
 
 
 def test_zarr_array(tmp_path):
-    zarr = pytest.importorskip("zarr")
+    zarr = pytest.importorskip('zarr')
     image = np.random.default_rng(9).random((13, 15, 11)) < 0.2
-    source = zarr.open_array(str(tmp_path / "input.zarr"), mode="w", shape=image.shape, chunks=(4, 5, 3), dtype="u1")
-    out = zarr.open_array(str(tmp_path / "output.zarr"), mode="w", shape=image.shape, chunks=(4, 5, 3), dtype="i8")
+    source = zarr.open_array(str(tmp_path / 'input.zarr'), mode='w', shape=image.shape, chunks=(4, 5, 3), dtype='u1')
+    out = zarr.open_array(str(tmp_path / 'output.zarr'), mode='w', shape=image.shape, chunks=(4, 5, 3), dtype='i8')
     source[:] = image
     check(source, (4, 5, 3), 3, destination=out)
+
+
+def test_sqlite_resolver_batch_matches_scalar(tmp_path):
+    rng = np.random.default_rng(2026)
+    pairs = rng.integers(1, 300, size=(2000, 2), dtype=np.int64)
+    scalar = Equivalences(tmp_path / 'scalar.sqlite')
+    batched = Equivalences(tmp_path / 'batch.sqlite')
+    try:
+        for a, b in pairs:
+            scalar.union(int(a), int(b))
+        for start in range(0, len(pairs), 137):
+            batched.union_many(pairs[start:start + 137])
+        scalar.flush()
+        batched.flush()
+        keys = np.arange(1, 300, dtype=np.int64)
+        assert scalar.merges == batched.merges
+        scalar_map = {int(k): scalar.find(int(k))[2] for k in keys}
+        batch_map = {int(k): batched.find(int(k))[2] for k in keys}
+        assert scalar_map == batch_map
+    finally:
+        scalar.close()
+        batched.close()
+
+
+def test_many_independent_components_cross_chunk_boundaries():
+    image = np.zeros((48, 40, 40), dtype=bool)
+    image[:, ::3, ::3] = True
+    # Each axis-0 filament is a distinct 6-connected component and crosses
+    # every chunk boundary on that axis.
+    expected_components = len(range(0, 40, 3)) ** 2
+    out = np.empty(image.shape, dtype=np.int64)
+    result = label(image, out, chunks=(6, 10, 10), connectivity=1)
+    expected, count = reference(image, 1)
+    np.testing.assert_array_equal(out, expected)
+    assert count == expected_components
+    assert result.num_components == expected_components
+
+
+def test_finalize_flattens_multilevel_tree_and_preserves_minimum(tmp_path):
+    resolver = Equivalences(tmp_path / "eq-finalize.sqlite")
+    try:
+        resolver.union(10, 11)
+        resolver.union(20, 21)
+        resolver.union(10, 20)
+        resolver.union(1, 10)
+        resolver.flush()
+        resolver.finalize()
+        rows = resolver.db.execute(
+            "SELECT c.id, c.parent, p.parent "
+            "FROM nodes AS c JOIN nodes AS p ON p.id = c.parent"
+        ).fetchall()
+        assert all(parent == grandparent for _, parent, grandparent in rows)
+        old, new = resolver.replacements(
+            np.array([0, 1, 10, 11, 20, 21, 999], dtype=np.int64)
+        )
+        assert dict(zip(old.tolist(), new.tolist())) == {10: 1, 11: 1, 20: 1, 21: 1}
+    finally:
+        resolver.close()
+
+
+def test_materialize_replacements_obeys_budget(tmp_path):
+    resolver = Equivalences(tmp_path / "eq-materialize.sqlite")
+    try:
+        resolver.union(10, 11)
+        resolver.union(20, 21)
+        resolver.union(10, 20)
+        resolver.union(1, 10)
+        resolver.flush()
+        assert resolver.materialize_replacements(1) is None
+        materialized = resolver.materialize_replacements(16 * 10)
+        assert materialized is not None
+        old, new = materialized
+        assert dict(zip(old.tolist(), new.tolist())) == {10: 1, 11: 1, 20: 1, 21: 1}
+    finally:
+        resolver.close()
