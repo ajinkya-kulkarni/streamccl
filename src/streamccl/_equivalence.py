@@ -7,13 +7,19 @@ from pathlib import Path
 
 import numpy as np
 
+_SQL_BATCH = 400
+
 
 class Equivalences:
     """Union by size, path compression, and stable minimum-key representatives.
 
     Only components that participate in an equivalence need database rows.
-    All other provisional labels remain implicit singleton sets. The SQLite
+    All other provisional labels remain implicit singleton sets.  The SQLite
     page cache is bounded; no global Python dictionary of components is built.
+
+    Boundary equivalences are resolved in bounded batches.  A batch is scoped
+    to one boundary comparison, so memory scales with boundary area rather
+    than with the total number of components in the image.
     """
 
     def __init__(self, path: Path, cache_bytes: int = 8 * 1024 * 1024):
@@ -53,30 +59,88 @@ class Equivalences:
             self.db.execute("UPDATE nodes SET parent = ? WHERE id = ?", (current, node))
         return current, size, minimum
 
-    def union(self, a: int, b: int) -> bool:
-        ra, sa, ma = self.find(int(a))
-        rb, sb, mb = self.find(int(b))
-        if ra == rb:
-            return False
-        if sa < sb or (sa == sb and ra > rb):
-            ra, rb = rb, ra
-            sa, sb = sb, sa
-        self.db.execute(
-            "INSERT INTO nodes VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET parent=excluded.parent, "
-            "size=excluded.size, minimum=excluded.minimum",
-            (ra, ra, sa + sb, min(ma, mb)),
-        )
-        self.db.execute(
-            "INSERT INTO nodes VALUES (?, ?, 0, ?) "
-            "ON CONFLICT(id) DO UPDATE SET parent=excluded.parent, size=0",
-            (rb, ra, mb),
-        )
-        self.merges += 1
-        self._pending += 1
+    def _load_rows(self, keys: set[int]) -> dict[int, list[int]]:
+        rows: dict[int, list[int]] = {}
+        pending = set(keys)
+        while pending:
+            batch = list(pending)[:_SQL_BATCH]
+            pending.difference_update(batch)
+            marks = ",".join("?" for _ in batch)
+            fetched = self.db.execute(
+                f"SELECT id, parent, size, minimum FROM nodes WHERE id IN ({marks})", batch
+            ).fetchall()
+            found = {int(row[0]) for row in fetched}
+            for key, parent, size, minimum in fetched:
+                rows[int(key)] = [int(parent), int(size), int(minimum)]
+            for key in batch:
+                if key not in found:
+                    rows[key] = [key, 1, key]
+            for key, (parent, _, _) in tuple(rows.items()):
+                if parent not in rows:
+                    pending.add(parent)
+        return rows
+
+    def union_many(self, pairs: np.ndarray) -> int:
+        """Resolve a bounded array of ``(a, b)`` equivalences efficiently.
+
+        Returns the number of newly merged disjoint sets. Reads and writes are
+        batched so high-boundary-component workloads do not issue several SQL
+        statements per pair.
+        """
+        pairs = np.asarray(pairs, dtype=np.int64)
+        if pairs.size == 0:
+            return 0
+        pairs = pairs.reshape(-1, 2)
+        keys = {int(x) for x in pairs.ravel()}
+        rows = self._load_rows(keys)
+        dirty: set[int] = set()
+
+        def find_local(key: int) -> tuple[int, int, int]:
+            path: list[int] = []
+            current = key
+            while True:
+                parent, size, minimum = rows[current]
+                if parent == current:
+                    break
+                path.append(current)
+                current = parent
+            for node in path:
+                if rows[node][0] != current:
+                    rows[node][0] = current
+                    dirty.add(node)
+            return current, size, minimum
+
+        merged = 0
+        for a, b in pairs:
+            ra, sa, ma = find_local(int(a))
+            rb, sb, mb = find_local(int(b))
+            if ra == rb:
+                continue
+            if sa < sb or (sa == sb and ra > rb):
+                ra, rb = rb, ra
+                sa, sb = sb, sa
+                ma, mb = mb, ma
+            rows[ra] = [ra, sa + sb, min(ma, mb)]
+            rows[rb] = [ra, 0, mb]
+            dirty.add(ra)
+            dirty.add(rb)
+            merged += 1
+
+        if dirty:
+            self.db.executemany(
+                "INSERT INTO nodes VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET parent=excluded.parent, "
+                "size=excluded.size, minimum=excluded.minimum",
+                ((key, *rows[key]) for key in dirty),
+            )
+        self.merges += merged
+        self._pending += merged
         if self._pending >= 4096:
             self.flush()
-        return True
+        return merged
+
+    def union(self, a: int, b: int) -> bool:
+        return bool(self.union_many(np.asarray([[a, b]], dtype=np.int64)))
 
     def flush(self) -> None:
         self.db.commit()
@@ -86,8 +150,8 @@ class Equivalences:
         """Find changed canonical IDs among one chunk's sorted, unique keys."""
         old: list[int] = []
         new: list[int] = []
-        for start in range(0, len(keys), 400):
-            batch = [int(x) for x in keys[start : start + 400] if x != 0]
+        for start in range(0, len(keys), _SQL_BATCH):
+            batch = [int(x) for x in keys[start : start + _SQL_BATCH] if x != 0]
             if not batch:
                 continue
             marks = ",".join("?" for _ in batch)
