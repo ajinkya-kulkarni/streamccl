@@ -133,7 +133,8 @@ Final `0.1.0` development measurements with `32³` chunks, 6-connectivity and a
 | Shape | Independent components | Cross-chunk equivalences | Time | Throughput | Peak RSS |
 |---|---:|---:|---:|---:|---:|
 | 256³ | 16,384 | 114,688 | 3.90 s | 4.31 Mvox/s | 140 MiB |
-| 384³ | 36,864 | 405,504 | 12.53 s | 4.52 Mvox/s | 153 MiB |
+| 384³ | 36,864 | 405,504 | 12.46 s | 4.54 Mvox/s | 153 MiB |
+| 512³ | 65,536 | 983,040 | 31.74 s | 4.23 Mvox/s | 166 MiB |
 
 Run it yourself:
 
@@ -156,14 +157,16 @@ PYTHONPATH=src python benchmarks/benchmark_resolver.py \
 ```
 
 On the same development environment this produced **1,048,576 explicit nodes**,
-**983,040 merges**, **11.88 s** union time and **0.155 s** finalization time
-(**12.04 s total**). This benchmark isolates global equivalence resolution from
+**983,040 merges**, **12.21 s** union time and **0.159 s** finalization time
+(**12.37 s total**). This benchmark isolates global equivalence resolution from
 storage-backend throughput.
 
 These are development measurements from one Linux container, not cross-machine
-performance guarantees. Very high-equivalence end-to-end workloads remain
-storage-sensitive; users should benchmark their actual Zarr/HDF5/object-store
-backend and place resolver scratch on local storage where possible.
+performance guarantees. The 512³ filament case demonstrates that the previous million-equivalence
+scaling wall is gone in the current implementation. End-to-end performance is
+still storage-sensitive, so users should benchmark their actual
+Zarr/HDF5/object-store backend and place resolver scratch on local storage where
+possible.
 
 ## Non-goals for 0.1
 
