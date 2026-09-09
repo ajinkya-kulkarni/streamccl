@@ -14,6 +14,7 @@ dependencies = ["numpy>=1.24", "scipy>=1.10"]
 [project.optional-dependencies]
 zarr = ["zarr>=2.16,<4"]
 test = ["pytest>=8", "zarr>=2.16,<4"]
+benchmark = ["psutil>=5.9", "h5py>=3.9"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
