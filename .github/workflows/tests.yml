@@ -11,9 +11,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - python: "3.11"
+          - python: "3.10"
             zarr: "zarr>=2.16,<3"
           - python: "3.11"
+            zarr: "zarr>=2.16,<3"
+          - python: "3.12"
+            zarr: "zarr>=3,<4"
+          - python: "3.13"
             zarr: "zarr>=3,<4"
     steps:
       - uses: actions/checkout@v4
