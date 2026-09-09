@@ -96,6 +96,8 @@ def _indices(grid: tuple[int, ...]) -> Iterator[tuple[int, ...]]:
 
 def _local_ids(binary: np.ndarray, bounds: tuple[tuple[int, int], ...],
                shape: tuple[int, ...], structure: np.ndarray) -> tuple[np.ndarray, int]:
+    # SciPy's labeling is local only.  Stable global keys are derived from each
+    # local component's first voxel, not from the chunk's position or label order.
     local, count = ndi.label(binary, structure=structure)
     if count == 0:
         return np.zeros(local.shape, dtype=np.int64), 0
@@ -123,6 +125,8 @@ def _boundary_pairs(out: Any, shape: tuple[int, ...], chunks: tuple[int, ...],
     ndim = len(shape)
     grid = _grid(shape, chunks)
     offsets = _offsets(ndim, connectivity)
+    # A pair of chunks is visited once.  All relevant voxel offsets are
+    # considered, including face/edge/corner contacts at 8/18/26 connectivity.
     neighbor_deltas = tuple(
         d for d in itertools.product((-1, 0, 1), repeat=ndim)
         if any(d) and next(v for v in d if v != 0) < 0
@@ -138,6 +142,8 @@ def _boundary_pairs(out: Any, shape: tuple[int, ...], chunks: tuple[int, ...],
             for offset in offsets:
                 if any(d != 0 and v != d for d, v in zip(delta, offset)):
                     continue
+                # A point x in the current chunk is adjacent to x+offset in
+                # the other chunk.  Intersect the two global coordinate ranges.
                 starts = tuple(max(a, c - v) for (a, _), (c, _), v in zip(current, other, offset))
                 stops = tuple(min(b, d - v) for (_, b), (_, d), v in zip(current, other, offset))
                 if any(a >= b for a, b in zip(starts, stops)):
@@ -155,10 +161,17 @@ def _boundary_pairs(out: Any, shape: tuple[int, ...], chunks: tuple[int, ...],
 def _replace(labels: np.ndarray, old: np.ndarray, new: np.ndarray) -> np.ndarray:
     if not len(old):
         return labels
-    positions = np.searchsorted(old, labels)
+    # Background is always zero and never participates in equivalence
+    # resolution.  Searching only foreground values avoids doing a binary
+    # search for every background voxel, which matters for the sparse masks
+    # streamccl is primarily designed to process.
+    foreground = labels != 0
+    values = labels[foreground]
+    positions = np.searchsorted(old, values)
     clipped = np.minimum(positions, len(old) - 1)
-    hit = (positions < len(old)) & (old[clipped] == labels)
-    labels[hit] = new[positions[hit]]
+    hit = (positions < len(old)) & (old[clipped] == values)
+    values[hit] = new[positions[hit]]
+    labels[foreground] = values
     return labels
 
 
@@ -173,7 +186,7 @@ def label(source: Any, out: Any, *, chunks: Sequence[int] | None = None,
     On failure its contents are undefined; v1 does not support resumability.
 
     `memory_limit` is a conservative chunk-planning budget, not an operating-
-    system RSS guarantee. The SQLite resolver uses a bounded page cache; its
+    system RSS guarantee.  The SQLite resolver uses a bounded page cache; its
     temporary database may grow with the number of boundary components.
     Labels are stable, non-dense, one-based global C-order first-voxel indices.
     """
@@ -182,6 +195,8 @@ def label(source: Any, out: Any, *, chunks: Sequence[int] | None = None,
         raise ValueError("source must be a 2D or 3D array")
     if tuple(out.shape) != shape:
         raise ValueError("source and out must have the same shape")
+    if source is out:
+        raise ValueError("source and out must be distinct arrays")
     if math.prod(shape) > _MAX_ID:
         raise ValueError("image is too large for int64 component IDs")
     dtype = np.dtype(out.dtype)
@@ -204,6 +219,7 @@ def label(source: Any, out: Any, *, chunks: Sequence[int] | None = None,
     with tempfile.TemporaryDirectory(prefix="streamccl-", dir=workdir) as directory:
         resolver = Equivalences(Path(directory) / "equivalences.sqlite")
         try:
+            # Pass 1: local CCL, immediately persisted as stable provisional IDs.
             for index in _indices(grid):
                 bounds = _bounds(index, shape, tile)
                 sl = _slices(bounds)
@@ -211,15 +227,42 @@ def label(source: Any, out: Any, *, chunks: Sequence[int] | None = None,
                 provisional, count = _local_ids(binary, bounds, shape, structure)
                 out[sl] = provisional
                 total += count
+            # Pass 2: visit every cross-chunk neighbor pair; never build a
+            # global graph or materialize the full image.
             for pairs in _boundary_pairs(out, shape, tile, connectivity):
                 resolver.union_many(pairs)
             resolver.flush()
             count = total - resolver.merges
+            # Pass 3: apply global canonical IDs.  If the complete sparse
+            # replacement map fits in the unused planning budget, materialize
+            # it once; otherwise keep canonical lookups disk-backed per chunk.
             if resolver.merges:
+                effective = tuple(min(s, c) for s, c in zip(shape, tile))
+                planned_chunk_bytes = math.prod(effective) * _PLANNER_BYTES_PER_VOXEL
+                spare = max(0, budget - planned_chunk_bytes - _RESOLVER_CACHE)
+                global_map = resolver.materialize_replacements(spare)
                 for index in _indices(grid):
                     sl = _slices(_bounds(index, shape, tile))
                     block = np.asarray(out[sl]).astype(np.int64, copy=True)
-                    old, new = resolver.replacements(np.unique(block))
+                    if global_map is None:
+                        old, new = resolver.replacements(np.unique(block))
+                    else:
+                        old, new = global_map
+                        # Provisional IDs are first-voxel indices created
+                        # inside this chunk.  Restrict the global sparse map
+                        # to the numeric range actually present in the block
+                        # before searchsorted-based replacement.
+                        foreground = block != 0
+                        if np.any(foreground):
+                            lo = int(block[foreground].min())
+                            hi = int(block[foreground].max())
+                            start = int(np.searchsorted(old, lo, side="left"))
+                            stop = int(np.searchsorted(old, hi, side="right"))
+                            old = old[start:stop]
+                            new = new[start:stop]
+                        else:
+                            old = old[:0]
+                            new = new[:0]
                     if len(old):
                         out[sl] = _replace(block, old, new)
             return LabelResult(out, count)
