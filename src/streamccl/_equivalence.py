@@ -24,6 +24,12 @@ class Equivalences:
 
     def __init__(self, path: Path, cache_bytes: int = 8 * 1024 * 1024):
         self.db = sqlite3.connect(path)
+        # The resolver database is private, ephemeral scratch state.  It never
+        # needs crash recovery and is not shared across processes, so avoid
+        # journal/fsync/lock-manager overhead while keeping the page cache bounded.
+        self.db.execute("PRAGMA locking_mode = EXCLUSIVE")
+        self.db.execute("PRAGMA journal_mode = OFF")
+        self.db.execute("PRAGMA synchronous = OFF")
         self.db.execute(f"PRAGMA cache_size = -{max(1, cache_bytes // 1024)}")
         self.db.execute("PRAGMA temp_store = FILE")
         self.db.execute(
@@ -32,6 +38,7 @@ class Equivalences:
         )
         self.merges = 0
         self._pending = 0
+        self._finalized = False
 
     def close(self) -> None:
         try:
@@ -62,6 +69,10 @@ class Equivalences:
     def _load_rows(self, keys: set[int]) -> dict[int, list[int]]:
         rows: dict[int, list[int]] = {}
         pending = set(keys)
+        # Parents may live outside the boundary batch (for example a filament
+        # already merged across previous chunks).  Fetch missing ancestor rows
+        # in bounded SQL batches until every cached path reaches a known root
+        # or an implicit singleton.
         while pending:
             batch = list(pending)[:_SQL_BATCH]
             pending.difference_update(batch)
@@ -83,7 +94,7 @@ class Equivalences:
     def union_many(self, pairs: np.ndarray) -> int:
         """Resolve a bounded array of ``(a, b)`` equivalences efficiently.
 
-        Returns the number of newly merged disjoint sets. Reads and writes are
+        Returns the number of newly merged disjoint sets.  Reads and writes are
         batched so high-boundary-component workloads do not issue several SQL
         statements per pair.
         """
@@ -135,6 +146,8 @@ class Equivalences:
             )
         self.merges += merged
         self._pending += merged
+        if merged:
+            self._finalized = False
         if self._pending >= 4096:
             self.flush()
         return merged
@@ -146,23 +159,106 @@ class Equivalences:
         self.db.commit()
         self._pending = 0
 
+    def finalize(self) -> None:
+        """Flatten explicit parent chains using bounded batched pointer jumping.
+
+        The resolver deliberately keeps its global state on disk.  A single
+        correlated SQL ``UPDATE`` over a million nodes is pathologically slow
+        in SQLite, so finalization scans only nodes whose parent is not yet a
+        root and updates them in bounded batches.  Union-by-size keeps the
+        forest shallow, making this a small number of sequential passes while
+        memory remains independent of the total node count.
+        """
+        if self._finalized:
+            return
+        self.flush()
+        batch_size = 16_384
+        while True:
+            changed = 0
+            last_id = -1
+            while True:
+                rows = self.db.execute(
+                    "SELECT c.id, p.parent "
+                    "FROM nodes AS c JOIN nodes AS p ON p.id = c.parent "
+                    "WHERE c.id > ? AND c.parent != c.id AND p.parent != p.id "
+                    "ORDER BY c.id LIMIT ?",
+                    (last_id, batch_size),
+                ).fetchall()
+                if not rows:
+                    break
+                self.db.executemany(
+                    "UPDATE nodes SET parent = ? WHERE id = ?",
+                    ((int(parent), int(key)) for key, parent in rows),
+                )
+                changed += len(rows)
+                last_id = int(rows[-1][0])
+            self.db.commit()
+            if changed == 0:
+                break
+        self._finalized = True
+
+    def materialize_replacements(
+        self, max_bytes: int
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return the complete canonical map when it fits in ``max_bytes``.
+
+        Two int64 arrays cost exactly 16 bytes per changed provisional label.
+        If the map would exceed the caller's spare-memory budget, return
+        ``None`` and let the caller use chunk-local disk-backed lookups.
+        """
+        self.finalize()
+        row = self.db.execute(
+            "SELECT count(*) FROM nodes AS c "
+            "JOIN nodes AS r ON r.id = c.parent "
+            "WHERE r.minimum != c.id"
+        ).fetchone()
+        count = int(row[0])
+        if count == 0:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty.copy()
+        if count * 16 > max_bytes:
+            return None
+        old = np.empty(count, dtype=np.int64)
+        new = np.empty(count, dtype=np.int64)
+        cursor = self.db.execute(
+            "SELECT c.id, r.minimum FROM nodes AS c "
+            "JOIN nodes AS r ON r.id = c.parent "
+            "WHERE r.minimum != c.id ORDER BY c.id"
+        )
+        offset = 0
+        while True:
+            rows = cursor.fetchmany(16_384)
+            if not rows:
+                break
+            n = len(rows)
+            old[offset : offset + n] = [int(key) for key, _ in rows]
+            new[offset : offset + n] = [int(minimum) for _, minimum in rows]
+            offset += n
+        if offset != count:
+            raise RuntimeError("resolver replacement count changed during materialization")
+        return old, new
+
     def replacements(self, keys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Find changed canonical IDs among one chunk's sorted, unique keys."""
+        self.finalize()
         old: list[int] = []
         new: list[int] = []
+        # Finalization makes canonical IDs a direct column lookup, avoiding a
+        # parent-chain query for every provisional component in every chunk.
         for start in range(0, len(keys), _SQL_BATCH):
             batch = [int(x) for x in keys[start : start + _SQL_BATCH] if x != 0]
             if not batch:
                 continue
             marks = ",".join("?" for _ in batch)
             rows = self.db.execute(
-                f"SELECT id FROM nodes WHERE id IN ({marks})", batch
+                f"SELECT c.id, r.minimum FROM nodes AS c "
+                f"JOIN nodes AS r ON r.id = c.parent "
+                f"WHERE c.id IN ({marks}) AND r.minimum != c.id",
+                batch,
             ).fetchall()
-            for (key,) in rows:
-                _, _, minimum = self.find(key)
-                if minimum != key:
-                    old.append(key)
-                    new.append(minimum)
+            for key, minimum in rows:
+                old.append(int(key))
+                new.append(int(minimum))
         if not old:
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
         order = np.argsort(old)
