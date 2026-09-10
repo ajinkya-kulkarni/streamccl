@@ -30,3 +30,25 @@ jobs:
           python -m pip install -e . pytest "${{ matrix.zarr }}"
       - name: Test
         run: pytest -q
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build and check distributions
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+      - name: Smoke-test wheel
+        run: |
+          python -m pip install dist/*.whl
+          python - <<'PY'
+          import streamccl
+          from streamccl import label
+          print(streamccl.__name__, label.__name__)
+          PY
