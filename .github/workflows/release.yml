@@ -2,6 +2,13 @@ name: release
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "src/**"
+      - "README.md"
+      - "LICENSE"
+      - ".github/workflows/release.yml"
   release:
     types: [published]
 
